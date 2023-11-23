@@ -8,6 +8,8 @@ import torch.optim as optim
 import torchvision.transforms as T
 from torch.optim.lr_scheduler import StepLR
 from torchvision.datasets import MNIST
+from lightning.fabric import Fabric, seed_everything
+from torchmetrics.classification import Accuracy
 
 # Define Model
 
@@ -37,9 +39,8 @@ class Net(nn.Module):
     
 def run(hparams):
 
-    torch.manual_seed(hparams.seed)
-    use_cuda = torch.cuda.is_available()
-    device = "cuda" if use_cuda else "cpu"
+    fabric = Fabric()
+    seed_everything(hparams.seed)
 
     transform = T.Compose(
         [
@@ -48,32 +49,42 @@ def run(hparams):
         ]
     )
 
-    train_data = MNIST("data/", train=True, download=True,transform=transform)
-    test_data = MNIST("data/", train=False, transform=transform)
+    # Let rank 0 download the data first, then everyone will load MNIST
+    with fabric.rank_zero_first(local=False):  # set `local=True` if your filesystem is not shared between machines
+        train_dataset = MNIST("data/", download=fabric.is_global_zero, train=True, transform=transform)
+        test_dataset = MNIST("data/", download=fabric.is_global_zero, train=False, transform=transform)
 
     # Loaders
     train_loader = torch.utils.data.DataLoader(
-        train_data,
+        train_dataset,
         batch_size=hparams.batch_size
     )
 
     test_loader = torch.utils.data.DataLoader(
-        test_data,
+        test_dataset,
         batch_size=hparams.batch_size
     )
 
-    model = Net()
-    model = model.to(device)
+    # don't forget to call `setup_dataloaders` to prepare for dataloaders for distributed training.
+    train_loader, test_loader = fabric.setup_dataloaders(train_loader, test_loader)
 
+    model = Net()
     optimizer = optim.Adadelta(model.parameters(), lr = hparams.lr)
+
+    # don't forget to call `setup` to prepare for model / optimizer for distributed training.
+    # the model is moved automatically to the right device.
+    model, optimizer = fabric.setup(model, optimizer)
+
     scheduler = StepLR(optimizer, step_size=1, gamma=hparams.gamma)
+
+    # use torchmetrics instead of manually computing the accuracy
+    test_acc = Accuracy(task="multiclass", num_classes=10).to(fabric.device)
 
     # Train Loop
     for epoch in range(hparams.epoch):
         model.train()
 
         for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
 
             optimizer.zero_grad()
             output = model(data)
@@ -91,7 +102,10 @@ def run(hparams):
                         loss.item(),
                     )
                 )
-                            
+
+                if hparams.dry_run:
+                    break
+            
             scheduler.step()
 
             # Testing Loop
@@ -101,25 +115,55 @@ def run(hparams):
 
             with torch.no_grad():
                 for data, target in test_loader:
-                    data, target = data.to(device), target.to(device)
+                    
                     output = model(data)
 
                     test_loss += F.nll_loss(output, target, reduction="sum").item()
-                    pred = output.argmax(dim=1, keepdim=True)
-                    correct += pred.eq(target.view_as(pred)).sum().item()
+
+                    # WITHOUT TorchMetrics
+                    # pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+                    # correct += pred.eq(target.view_as(pred)).sum().item()
+
+                    # WITH TorchMetrics
+                    test_acc(output, target)
+
+                    if hparams.dry_run:
+                        break
             
             test_loss /= len(test_loader.dataset)
 
-            print(
-            "\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n".format(
-                test_loss, correct, len(test_loader.dataset), 100.0 * correct / len(test_loader.dataset)
-            )
-        )
+        # all_gather is used to aggregated the value across processes
+        test_loss = fabric.all_gather(test_loss).sum() / len(test_loader.dataset)
+
+        print(f"\nTest set: Average loss: {test_loss:.4f}, Accuracy: ({100 * test_acc.compute():.0f}%)\n")
+        test_acc.reset()
+
+
+        if hparams.dry_run:
+            break
+
+    if hparams.save_model:
+        torch.save(model.state_dict(), "mnist_cnn.pt")
 
 
 def main():
     parser = argparse.ArgumentParser(description="PyTorch MNIST Example")
-    
+    parser.add_argument(
+        "--batch-size", type=int, default=64, metavar="N", help="input batch size for training (default: 64)"
+    )
+    parser.add_argument("--epochs", type=int, default=14, metavar="N", help="number of epochs to train (default: 14)")
+    parser.add_argument("--lr", type=float, default=1.0, metavar="LR", help="learning rate (default: 1.0)")
+    parser.add_argument("--gamma", type=float, default=0.7, metavar="M", help="Learning rate step gamma (default: 0.7)")
+    parser.add_argument("--dry-run", action="store_true", default=False, help="quickly check a single pass")
+    parser.add_argument("--seed", type=int, default=1, metavar="S", help="random seed (default: 1)")
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        metavar="N",
+        help="how many batches to wait before logging training status",
+    )
+    parser.add_argument("--save-model", action="store_true", default=False, help="For Saving the current Model")
     hparams = parser.parse_args()
     run(hparams)
 
